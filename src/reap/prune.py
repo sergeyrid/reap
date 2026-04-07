@@ -342,8 +342,8 @@ def main():
             logger.info("Running smoke test on the merged model...")
             try:
                 smoke_test(model, tokenizer)
-            except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
+            except Exception:
+                logger.exception(f"Smoke test failed")
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
