@@ -3,6 +3,7 @@ import time
 import logging
 import dataclasses
 import pathlib
+import re
 import time
 from typing import Any
 import gc
@@ -99,6 +100,7 @@ def prune(
     Prune the model based on the observer data and clustering.
     """
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    retained_by_layer = {}
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -153,6 +155,7 @@ def prune(
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
+        retained_by_layer[layer] = [int(x) for x in retained_expert_indicies]
         # prune experts
         moe = get_moe(model, layer)
         if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
@@ -214,7 +217,37 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    model.save_pretrained(pruned_model_dir)
+    state_dict = model.state_dict()
+
+    for layer, retained in retained_by_layer.items():
+        prefix = f"model.layers.{layer}.mlp.experts."
+        index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(retained)}
+
+        filtered_state_dict = {}
+
+        for key, value in state_dict.items():
+            if not key.startswith(prefix):
+                filtered_state_dict[key] = value
+                continue
+
+            m = re.match(rf"^{re.escape(prefix)}(\d+)\.(.+)$", key)
+            if m is None:
+                filtered_state_dict[key] = value
+                continue
+
+            old_idx = int(m.group(1))
+            suffix = m.group(2)
+
+            if old_idx not in index_map:
+                continue
+
+            new_idx = index_map[old_idx]
+            new_key = f"{prefix}{new_idx}.{suffix}"
+            filtered_state_dict[new_key] = value
+
+        state_dict = filtered_state_dict
+
+    model.save_pretrained(pruned_model_dir, state_dict=state_dict)
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
