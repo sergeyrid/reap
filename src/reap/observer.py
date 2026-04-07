@@ -367,17 +367,81 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
+            input = args[0]  # (batch_size, seq_len, hidden_dim)
+            device = input.device
+            batch_size, sequence_length, hidden_dim = input.shape
+            flat_input = input.view(-1, hidden_dim)  # (tokens, hidden)
+            if layer_number not in self.state:
+                self.state[layer_number] = self._initialize_state(output, num_experts)
+
+            # GLM-5 / GlmMoeDsaMoE special case
+            if module.__class__.__name__ == "GlmMoeDsaMoE":
+                state = self.state[layer_number]
+
+                # Router path used by GLM-5
+                router_logits = module.gate(flat_input)  # (tokens, num_experts)
+                topk_indices, topk_weights = module.route_tokens_to_experts(router_logits)
+
+                # Unweighted token frequency
+                expert_frequency = torch.bincount(
+                    topk_indices.reshape(-1), minlength=num_experts
+                ).to(device)
+
+                state["total_tokens"] += torch.tensor(
+                    flat_input.shape[0], device="cpu", dtype=torch.long
+                )
+                state["expert_frequency"] += expert_frequency.to("cpu", torch.long)
+
+                # Compute pruning metrics expert-by-expert from packed weights
+                for exp_idx in range(num_experts):
+                    row_idx, topk_pos = (topk_indices == exp_idx).nonzero(as_tuple=True)
+                    if row_idx.numel() == 0:
+                        continue
+
+                    expert_input = flat_input[row_idx]  # (n_active, hidden)
+
+                    compute_dtype = expert_input.dtype  # usually torch.bfloat16 for GLM-5 FP8
+
+                    gate_up = module.experts.gate_up_proj[exp_idx].to(dtype=compute_dtype)
+                    down = module.experts.down_proj[exp_idx].to(dtype=compute_dtype)
+                    expert_input = expert_input.to(dtype=compute_dtype)
+
+                    gate, up = F.linear(expert_input, gate_up).chunk(2, dim=-1)
+                    expert_hidden = module.experts.act_fn(gate) * up
+                    expert_out = F.linear(expert_hidden, down)
+
+                    weights = topk_weights[row_idx, topk_pos].to(torch.float32)
+                    ean_norm = torch.linalg.norm(expert_out, dim=-1).to(torch.float32)
+
+                    state["ean_sum"][exp_idx] += ean_norm.sum().to(torch.float64).cpu()
+                    state["weighted_ean_sum"][exp_idx] += (
+                            ean_norm * weights
+                    ).sum().to(torch.float64).cpu()
+                    state["weighted_expert_frequency_sum"][exp_idx] += (
+                        weights.sum().to(torch.float64).cpu()
+                    )
+
+                    state["ean_mean"].update(
+                        ean_norm.mean().view(1).cpu(),
+                        torch.tensor([row_idx.numel()], dtype=torch.long),
+                    )
+                    state["reap"].update(
+                        (ean_norm * weights).mean().view(1).cpu(),
+                        torch.tensor([row_idx.numel()], dtype=torch.long),
+                    )
+
+                    current_max = expert_out.abs().max().to(torch.float32).cpu()
+                    state["max_activations"][exp_idx] = torch.maximum(
+                        state["max_activations"][exp_idx], current_max
+                    )
+
+                return
+
             if not len(output) >= 2:
                 raise ValueError(
                     f"Expected output of module {module.__class__.__name__} at layer "
                     f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
                 )
-            input = args[0]  # (batch_size, seq_len, hidden_dim)
-            device = input.device
-            if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
-            batch_size, sequence_length, hidden_dim = input.shape
-            flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
 
             attention_mask = self._current_attention_mask
             if attention_mask is not None:
@@ -619,6 +683,15 @@ class MoETransformerObserver(BaseTransformerObserver):
 
 
 @dataclass
+class Glm5MoEObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "GlmMoeDsaMoE"
+    num_experts_attr_name: str = "n_routed_experts"
+    top_k_attr_name: str = "top_k"
+    fused_experts: bool = True
+    record_pruning_metrics_only: bool = True
+
+
+@dataclass
 class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "Qwen3MoeSparseMoeBlock"
 
@@ -664,6 +737,7 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 
 
 OBSERVER_CONFIG_REGISTRY = {
+    "GlmMoeDsaForCausalLM": Glm5MoEObserverHookConfig,
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,

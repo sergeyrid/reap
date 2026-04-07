@@ -32,7 +32,14 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    prune_glm5_moe_inplace,
+)
 from reap.eval import run_evaluate
 import shutil
 
@@ -148,7 +155,9 @@ def prune(
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+        if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+            prune_glm5_moe_inplace(moe, retained_expert_indicies)
+        elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -189,6 +198,13 @@ def prune(
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     setattr(model.config, model_attrs["num_experts"], retained_experts)
+
+    if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+        model.config.num_experts_per_tok = min(
+            int(model.config.num_experts_per_tok),
+            retained_experts,
+        )
+
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
