@@ -243,6 +243,7 @@ def get_pruned_model_dir(
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     parser = HfArgumentParser(
         (
             ReapArgs,
