@@ -2,6 +2,7 @@ from __future__ import annotations
 import time
 import logging
 import dataclasses
+import json
 import pathlib
 import time
 from typing import Any
@@ -99,6 +100,7 @@ def prune(
     Prune the model based on the observer data and clustering.
     """
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    retained_by_layer = {}
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -127,14 +129,6 @@ def prune(
                     if metric in observer_data[layer]:
                         observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
-    moe = get_moe(model, 10)
-    print("=== GLM5 experts params ===")
-    for name, param in moe.experts.named_parameters(recurse=True):
-        print(name, tuple(param.shape), param.dtype)
-    print("=== GLM5 experts buffers ===")
-    for name, buf in moe.experts.named_buffers(recurse=True):
-        print(name, tuple(buf.shape), buf.dtype)
-
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
         if prune_args.prune_method == "ean_ca":
@@ -161,6 +155,7 @@ def prune(
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
+        retained_by_layer[layer] = [int(x) for x in retained_expert_indicies]
         # prune experts
         moe = get_moe(model, layer)
         if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
@@ -229,6 +224,10 @@ def prune(
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
     )
+
+    with open(pruned_model_dir / "retained_experts.json", "w") as f:
+        json.dump({str(k): v for k, v in retained_by_layer.items()}, f, indent=2)
+
     return pruned_model_dir
 
 
