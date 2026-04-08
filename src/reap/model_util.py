@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import logging
 
 logger = logging.getLogger(__name__)
@@ -134,52 +135,65 @@ def get_moe(model, layer):
     return getattr(model.model.layers[layer], moe_attr_name)
 
 
-def prune_glm5_moe_inplace(moe, retained_expert_indices):
-    """
-    Prune a GLM-5 MoE block in-place.
+def _set_tensor_by_name(module: nn.Module, name: str, tensor: torch.Tensor, is_buffer: bool):
+    parts = name.split(".")
+    parent = module
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    leaf = parts[-1]
+    if is_buffer:
+        parent._buffers[leaf] = tensor
+    else:
+        parent._parameters[leaf] = nn.Parameter(tensor, requires_grad=False)
 
-    GLM-5 stores expert weights in packed tensors:
-      - moe.experts.gate_up_proj: [num_experts, 2 * intermediate, hidden]
-      - moe.experts.down_proj:    [num_experts, hidden, intermediate]
-    and routes with:
-      - moe.gate.weight
-      - moe.gate.e_score_correction_bias
-    """
+
+def prune_glm5_moe_inplace(moe, retained_expert_indices):
     keep = torch.as_tensor(
         retained_expert_indices,
         dtype=torch.long,
-        device=moe.experts.gate_up_proj.device,
+        device=moe.gate.weight.device,
     )
-    retained = int(keep.numel())
 
-    # Packed expert tensors
-    moe.experts.gate_up_proj = torch.nn.Parameter(
-        moe.experts.gate_up_proj.index_select(0, keep).contiguous()
-    )
-    moe.experts.down_proj = torch.nn.Parameter(
-        moe.experts.down_proj.index_select(0, keep).contiguous()
-    )
-    moe.experts.num_experts = retained
+    old_num_experts = int(moe.n_routed_experts)
+    new_num_experts = int(keep.numel())
+
+    # Prune every expert-packed parameter whose first dimension is num_experts
+    for name, param in list(moe.experts.named_parameters(recurse=True)):
+        if param is None:
+            continue
+        if param.ndim > 0 and param.shape[0] == old_num_experts:
+            new_param = param.index_select(0, keep).contiguous()
+            _set_tensor_by_name(moe.experts, name, new_param, is_buffer=False)
+
+    # Prune every expert-packed buffer too (this is the important FP8 part)
+    for name, buf in list(moe.experts.named_buffers(recurse=True)):
+        if buf is None:
+            continue
+        if buf.ndim > 0 and buf.shape[0] == old_num_experts:
+            new_buf = buf.index_select(0, keep).contiguous()
+            _set_tensor_by_name(moe.experts, name, new_buf, is_buffer=True)
 
     # Router
-    moe.gate.weight = torch.nn.Parameter(
-        moe.gate.weight.index_select(0, keep).contiguous()
+    moe.gate.weight = nn.Parameter(
+        moe.gate.weight.index_select(0, keep).contiguous(),
+        requires_grad=False,
     )
     if hasattr(moe.gate, "e_score_correction_bias") and moe.gate.e_score_correction_bias is not None:
         moe.gate.e_score_correction_bias = moe.gate.e_score_correction_bias.index_select(0, keep).contiguous()
 
-    # Module-level expert counts
-    moe.n_routed_experts = retained
-    moe.gate.n_routed_experts = retained
+    # Metadata
+    moe.n_routed_experts = new_num_experts
+    moe.gate.n_routed_experts = new_num_experts
+    if hasattr(moe.experts, "num_experts"):
+        moe.experts.num_experts = new_num_experts
 
-    # Clamp top-k in case retained < original top-k
-    new_top_k = min(int(moe.top_k), retained)
+    new_top_k = min(int(moe.top_k), new_num_experts)
     moe.top_k = new_top_k
     moe.gate.top_k = new_top_k
 
-    # Keep config consistent for save_pretrained()
-    moe.config.n_routed_experts = retained
-    moe.config.num_experts_per_tok = new_top_k
+    if hasattr(moe, "config"):
+        moe.config.n_routed_experts = new_num_experts
+        moe.config.num_experts_per_tok = new_top_k
 
 
 def assert_merge(model, merged_moe, cluster_label):
