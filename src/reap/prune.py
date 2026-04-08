@@ -215,6 +215,8 @@ def prune(
             retained_experts,
         ]
 
+    if pruned_model_dir.exists():
+        shutil.rmtree(pruned_model_dir)
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
     state_dict = model.state_dict()
