@@ -249,18 +249,6 @@ def prune(
 
         state_dict = filtered_state_dict
 
-    mx = -1
-    bad = []
-    for k in state_dict:
-        m = re.match(r"model\.layers\.10\.mlp\.experts\.(\d+)\.", k)
-        if m:
-            mx = max(mx, int(m.group(1)))
-        if "model.layers.10.mlp.experts.128" in k:
-            bad.append(k)
-
-    print("DEBUG max expert index in filtered state_dict for layer 10:", mx)
-    print("DEBUG stale expert 128 keys in filtered state_dict:", bad[:10])
-
     model.save_pretrained(pruned_model_dir, state_dict=state_dict)
     end = time.time()
     logger.info(
