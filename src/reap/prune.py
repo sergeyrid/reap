@@ -127,6 +127,14 @@ def prune(
                     if metric in observer_data[layer]:
                         observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
+    moe = get_moe(model, 10)
+    print("=== GLM5 experts params ===")
+    for name, param in moe.experts.named_parameters(recurse=True):
+        print(name, tuple(param.shape), param.dtype)
+    print("=== GLM5 experts buffers ===")
+    for name, buf in moe.experts.named_buffers(recurse=True):
+        print(name, tuple(buf.shape), buf.dtype)
+
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
         if prune_args.prune_method == "ean_ca":
