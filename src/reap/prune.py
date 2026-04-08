@@ -4,12 +4,15 @@ import logging
 import dataclasses
 import json
 import pathlib
+import re
 import time
 from typing import Any
 import gc
 import yaml
 
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
@@ -87,6 +90,165 @@ def dump_args_to_yaml(
     logger.info(f"All arguments saved to {output_path}")
 
 
+def repair_glm5_mtp_checkpoint(
+    source_model_dir: str | pathlib.Path,
+    pruned_model_dir: pathlib.Path,
+    retained_by_layer: dict[int, list[int]],
+) -> None:
+    """
+    Rebuild GLM-5 MTP layers in the pruned checkpoint.
+
+    Why this exists:
+    - HF AutoModelForCausalLM loads/saves the base GLM-5 model but drops the MTP
+      speculative layer(s) from the live model state.
+    - vLLM expects those MTP layers to be present in the checkpoint.
+    - We therefore copy them from the original checkpoint and prune/reindex their
+      MoE experts to match the pruned routed-expert count.
+
+    Current policy:
+    - Reuse the keep-list from the last main MoE layer (num_hidden_layers - 1)
+      for all MTP layers.
+    """
+    source_model_dir = pathlib.Path(source_model_dir)
+    pruned_model_dir = pathlib.Path(pruned_model_dir)
+
+    orig_cfg_path = source_model_dir / "config.json"
+    orig_idx_path = source_model_dir / "model.safetensors.index.json"
+    pruned_idx_path = pruned_model_dir / "model.safetensors.index.json"
+
+    if not orig_cfg_path.exists():
+        logger.warning(f"Skipping MTP repair: missing {orig_cfg_path}")
+        return
+    if not orig_idx_path.exists():
+        logger.warning(f"Skipping MTP repair: missing {orig_idx_path}")
+        return
+    if not pruned_idx_path.exists():
+        logger.warning(f"Skipping MTP repair: missing {pruned_idx_path}")
+        return
+
+    with open(orig_cfg_path, "r") as f:
+        orig_cfg = json.load(f)
+    with open(orig_idx_path, "r") as f:
+        orig_idx = json.load(f)
+    with open(pruned_idx_path, "r") as f:
+        pruned_idx = json.load(f)
+
+    num_hidden_layers = int(orig_cfg["num_hidden_layers"])
+    num_mtp_layers = int(orig_cfg.get("num_nextn_predict_layers", 0))
+    orig_n_routed_experts = int(orig_cfg["n_routed_experts"])
+
+    if num_mtp_layers <= 0:
+        logger.info("No MTP layers declared in source config; skipping MTP repair.")
+        return
+
+    donor_layer = num_hidden_layers - 1
+    if donor_layer not in retained_by_layer:
+        raise RuntimeError(
+            f"MTP repair needs retained experts for donor layer {donor_layer}, "
+            f"but retained_by_layer only has keys: {sorted(retained_by_layer)}"
+        )
+
+    keep = [int(x) for x in retained_by_layer[donor_layer]]
+    keep_tensor = torch.tensor(keep, dtype=torch.long)
+    keep_set = set(keep)
+    index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(keep)}
+
+    orig_weight_map = orig_idx["weight_map"]
+    pruned_weight_map = pruned_idx["weight_map"]
+
+    for mtp_layer in range(num_hidden_layers, num_hidden_layers + num_mtp_layers):
+        layer_prefix = f"model.layers.{mtp_layer}."
+        orig_layer_keys = sorted(
+            k for k in orig_weight_map.keys() if k.startswith(layer_prefix)
+        )
+
+        if not orig_layer_keys:
+            raise RuntimeError(
+                f"Source checkpoint has no keys for MTP layer {mtp_layer}"
+            )
+
+        # Load only this MTP layer from source checkpoint.
+        loaded = {}
+        by_shard = {}
+        for k in orig_layer_keys:
+            by_shard.setdefault(orig_weight_map[k], []).append(k)
+
+        for shard_name, shard_keys in by_shard.items():
+            shard_path = source_model_dir / shard_name
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for k in shard_keys:
+                    loaded[k] = f.get_tensor(k)
+
+        new_tensors = {}
+
+        # Per-expert weights are stored exploded in the source checkpoint.
+        expert_pat = re.compile(
+            rf"^model\.layers\.{mtp_layer}\.mlp\.experts\.(\d+)\.(.+)$"
+        )
+
+        for key, value in loaded.items():
+            m = expert_pat.match(key)
+            if m is not None:
+                old_idx = int(m.group(1))
+                suffix = m.group(2)
+
+                if old_idx not in keep_set:
+                    continue
+
+                new_idx = index_map[old_idx]
+                new_key = f"model.layers.{mtp_layer}.mlp.experts.{new_idx}.{suffix}"
+                new_tensors[new_key] = value
+                continue
+
+            # Slice any remaining expert-axis tensors under this MTP layer.
+            # This catches things like gate-side vectors/matrices that depend on
+            # n_routed_experts but are not stored as experts.<idx>.*
+            if value.ndim >= 1 and value.shape[0] == orig_n_routed_experts:
+                new_tensors[key] = value.index_select(0, keep_tensor).contiguous()
+                continue
+
+            if value.ndim >= 2 and value.shape[1] == orig_n_routed_experts:
+                new_tensors[key] = value.index_select(1, keep_tensor).contiguous()
+                continue
+
+            new_tensors[key] = value
+
+        out_name = f"model-mtp-layer{mtp_layer}-pruned.safetensors"
+        out_path = pruned_model_dir / out_name
+        save_file(new_tensors, str(out_path))
+
+        # Remove any old entries for this MTP layer, then register the repaired ones.
+        pruned_weight_map = {
+            k: v for k, v in pruned_weight_map.items() if not k.startswith(layer_prefix)
+        }
+        for k in new_tensors.keys():
+            pruned_weight_map[k] = out_name
+
+        # Sanity check: expert indices should now be contiguous and stop at len(keep)-1
+        max_idx = -1
+        for k in new_tensors.keys():
+            m = re.match(rf"model\.layers\.{mtp_layer}\.mlp\.experts\.(\d+)\.", k)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+        expected_max = len(keep) - 1
+        if max_idx != expected_max:
+            raise RuntimeError(
+                f"MTP layer {mtp_layer}: expected max expert index {expected_max}, "
+                f"got {max_idx}"
+            )
+
+        logger.info(
+            f"Repaired MTP layer {mtp_layer}: wrote {len(new_tensors)} tensors "
+            f"to {out_path.name}"
+        )
+
+    pruned_idx["weight_map"] = pruned_weight_map
+    with open(pruned_idx_path, "w") as f:
+        json.dump(pruned_idx, f, indent=2, sort_keys=True)
+
+    logger.info("Updated pruned checkpoint index with repaired MTP layers.")
+
+
 def prune(
     observer_data,
     model,
@@ -95,6 +257,7 @@ def prune(
     prune_args,
     n_experts_to_prune,
     pruned_model_dir,
+    source_model_dir,
 ):
     """
     Prune the model based on the observer data and clustering.
@@ -225,6 +388,13 @@ def prune(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
     )
 
+    if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+        repair_glm5_mtp_checkpoint(
+            source_model_dir=source_model_dir,
+            pruned_model_dir=pruned_model_dir,
+            retained_by_layer=retained_by_layer,
+        )
+
     with open(pruned_model_dir / "retained_experts.json", "w") as f:
         json.dump({str(k): v for k, v in retained_by_layer.items()}, f, indent=2)
 
@@ -343,6 +513,7 @@ def main():
             prune_args,
             n_experts_to_prune,
             pruned_model_dir,
+            source_model_dir=model_args.model_name,
         )
         logger.info("pruning completed.")
 
