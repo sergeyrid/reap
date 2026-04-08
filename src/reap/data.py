@@ -16,6 +16,7 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 import uuid
 import json
@@ -33,10 +34,30 @@ from vllm import TokensPrompt
 logger = logging.getLogger(__name__)
 
 
-def _maybe_json_load(value):
-    if isinstance(value, str):
-        return json.loads(value)
-    return value
+def _maybe_json_load(value, max_depth: int = 5):
+    """
+    Repeatedly JSON-decode strings until the result is no longer a string
+    or decoding fails.
+
+    This fixes cases like:
+      '{"a": 1}'               -> {'a': 1}
+      '"{\\"a\\": 1}"'         -> {'a': 1}
+    """
+    out = value
+    for _ in range(max_depth):
+        if not isinstance(out, str):
+            break
+        s = out.strip()
+        if not s:
+            break
+        try:
+            new_out = json.loads(s)
+        except Exception:
+            break
+        if new_out == out:
+            break
+        out = new_out
+    return out
 
 
 def _normalize_message_content(content) -> str:
@@ -58,6 +79,52 @@ def _normalize_message_content(content) -> str:
                 parts.append(str(item))
         return "\n".join(part for part in parts if part)
     return str(content)
+
+
+def _normalize_chat_template_sample(sample: dict) -> dict:
+    """
+    Normalize tool-calling samples so model chat templates receive the shapes they expect.
+
+    In particular:
+    - tools: JSON string -> Python list/dict
+    - tool_calls[*].function.arguments: JSON string -> dict
+    """
+    sample = deepcopy(sample)
+
+    # Normalize top-level tools if present.
+    if "tools" in sample:
+        parsed_tools = _maybe_json_load(sample["tools"])
+        if isinstance(parsed_tools, (list, dict)):
+            sample["tools"] = parsed_tools
+
+    messages = sample.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+
+                args = fn.get("arguments")
+
+                parsed_args = _maybe_json_load(args)
+
+                if isinstance(parsed_args, dict):
+                    fn["arguments"] = parsed_args
+                elif parsed_args in ("", None):
+                    fn["arguments"] = {}
+
+    return sample
 
 
 @dataclass
@@ -556,9 +623,10 @@ class BaseDatasetProcessor(ABC):
 
 class ChatDatasetProcessor(BaseDatasetProcessor):
     def _encode_sample(self, sample: dict) -> torch.Tensor:
+        sample = _normalize_chat_template_sample(sample)
         chat_template_kwargs = {}
         if self.tools_field in sample:
-            chat_template_kwargs = {"tools": _maybe_json_load(sample[self.tools_field])}
+            chat_template_kwargs = {"tools": sample[self.tools_field]}
         chat_sample = self.tokenizer.apply_chat_template(
             sample[self.messages_field],
             add_generation_prompt=False,
@@ -576,12 +644,12 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
         """Get the mapped dataset without tokenization applied."""
 
         def chat_template_fn(sample: dict[str, any]) -> dict[str, any]:
-            """Apply chat template to the sample."""
+            sample = _normalize_chat_template_sample(sample)
+
             chat_template_kwargs = {}
             if self.tools_field in sample:
-                chat_template_kwargs = {
-                    "tools": _maybe_json_load(sample[self.tools_field])
-                }
+                chat_template_kwargs = {"tools": sample[self.tools_field]}
+
             chat_sample = self.tokenizer.apply_chat_template(
                 sample[self.messages_field],
                 add_generation_prompt=False,
@@ -743,16 +811,26 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
         gt_tool_calls = _maybe_json_load(sample["answers"])
 
         for tool_call in gt_tool_calls:
+            raw_args = _maybe_json_load(tool_call["arguments"])
+
+            if raw_args in ("", None):
+                raw_args = {}
+            elif not isinstance(raw_args, dict):
+                # Last-resort fallback so chat templates don't crash.
+                raw_args = {}
+
             tool_calls.append(
                 {
                     "function": {
-                        "arguments": json.dumps(tool_call["arguments"]),
+                        "arguments": raw_args,
                         "name": tool_call["name"],
                     },
                     "id": f"chatcmpl-tool-{uuid.uuid4()}",
                     "type": "function",
                 }
             )
+
+        parsed_tools = _maybe_json_load(sample["tools"])
 
         return {
             "messages": [
@@ -763,11 +841,7 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
                     "tool_calls": tool_calls,
                 },
             ],
-            "tools": (
-                sample["tools"]
-                if isinstance(sample["tools"], str)
-                else json.dumps(sample["tools"])
-            ),
+            "tools": parsed_tools,
         }
 
 
