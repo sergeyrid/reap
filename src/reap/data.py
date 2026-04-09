@@ -816,13 +816,13 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
             if raw_args in ("", None):
                 raw_args = {}
             elif not isinstance(raw_args, dict):
-                # Last-resort fallback so chat templates don't crash.
                 raw_args = {}
 
             tool_calls.append(
                 {
                     "function": {
-                        "arguments": raw_args,
+                        # IMPORTANT: store as JSON string in dataset
+                        "arguments": json.dumps(raw_args, sort_keys=True),
                         "name": tool_call["name"],
                     },
                     "id": f"chatcmpl-tool-{uuid.uuid4()}",
@@ -831,6 +831,8 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
             )
 
         parsed_tools = _maybe_json_load(sample["tools"])
+        if not isinstance(parsed_tools, (list, dict)):
+            parsed_tools = []
 
         return {
             "messages": [
@@ -841,7 +843,8 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
                     "tool_calls": tool_calls,
                 },
             ],
-            "tools": parsed_tools,
+            # IMPORTANT: keep tools serialized too
+            "tools": json.dumps(parsed_tools, sort_keys=True),
         }
 
 
