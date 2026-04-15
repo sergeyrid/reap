@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
+from gptqmodel import GPTQModel, BACKEND
 
 
 from reap.main import record_activations, smoke_test, create_results_directory
@@ -446,12 +447,10 @@ def main():
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
-    model = AutoModelForCausalLM.from_pretrained(
+    model = GPTQModel.load(
         model_name,
         device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-        local_files_only=True,
+        backend=BACKEND.AWQ_GEMM_TRITON,
     )
     # record activations or load previously recorded activations
     logger.info(
