@@ -134,12 +134,29 @@ class BaseTransformerObserver(ABC):
                 == self.hook_config.module_class_name_to_hook_regex
             ):
                 hook_module = True
-            if hook_module:
-                layer_number = int(re.search(r"\d+", name).group(0))
+            if not hook_module:
+                continue
+
+            layer_match = re.search(r"\d+", name)
+            if layer_match is None:
+                logger.debug("Skipping matched module without layer index: %s", name)
+                continue
+
+            layer_number = int(layer_match.group(0))
+            try:
                 hook_fn = self._hook_factory(module, layer_number)
-                hook = module.register_forward_hook(hook_fn)
-                self.hooks.append(hook)
-                logger.info("Hooked module: %s at layer %d", name, layer_number)
+            except (AttributeError, ValueError) as exc:
+                logger.debug(
+                    "Skipping module %s (%s): %s",
+                    name,
+                    module.__class__.__name__,
+                    exc,
+                )
+                continue
+
+            hook = module.register_forward_hook(hook_fn)
+            self.hooks.append(hook)
+            logger.info("Hooked module: %s at layer %d", name, layer_number)
         if len(self.hooks) == 0:
             raise ValueError(
                 "No modules matched the provided hook configuration. "
@@ -739,7 +756,7 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 
 @dataclass
 class Glm44LiteQMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Glm4MoeLiteMoE"
+    module_name_to_hook_regex: Optional[str] = r"(?:^|\.)layers\.\d+\.mlp$"
     num_experts_attr_name: str = "config.n_routed_experts"
     top_k_attr_name: str = "config.num_experts_per_tok"
     fused_experts: bool = False
