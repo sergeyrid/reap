@@ -448,11 +448,12 @@ def main():
     # load model
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
-        torch_dtype="auto",
+        device_map=None,
+        torch_dtype=torch.float16,
         trust_remote_code=True,
         local_files_only=True,
     )
+    model.to("cuda:0")
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
