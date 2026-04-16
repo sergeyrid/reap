@@ -382,18 +382,6 @@ class MoETransformerObserver(BaseTransformerObserver):
                 "HookConfig settings."
             )
 
-        if self.hook_config.module_name_to_hook_regex is not None:
-            required_moe_attrs = ("gate", "experts")
-            missing_moe_attrs = [
-                attr_name for attr_name in required_moe_attrs if not hasattr(module, attr_name)
-            ]
-            if missing_moe_attrs:
-                raise ValueError(
-                    f"Module {module.__class__.__name__} at layer {layer_number} "
-                    "matches the hook regex but is not an MoE block; missing attrs: "
-                    f"{missing_moe_attrs}."
-                )
-
         @torch.no_grad()
         def _hook_fn(module, args, output):
             input = args[0]  # (batch_size, seq_len, hidden_dim)
