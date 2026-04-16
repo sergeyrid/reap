@@ -33,6 +33,51 @@ class BaseTransformerObserverHookConfig:
     module_class_name_to_hook_regex: Optional[nn.Module] = None
 
 
+def _glm5_single_expert_forward(module, expert_input, expert_idx, compute_dtype):
+    """
+    Compute the unweighted output of a single GLM-5 expert.
+
+    Works for:
+    - native / FP8 packed GlmMoeDsaNaiveMoe
+    - GPTQModel/AWQ replacements that still preserve the experts(...) call interface
+    """
+    x = expert_input.to(compute_dtype)
+
+    # Preferred path: use the experts module's public forward API.
+    # We pass a single routed expert and unit weights so the returned output
+    # is unweighted and matches the semantics of the original REAP math.
+    try:
+        local_idx = torch.full(
+            (x.shape[0], 1),
+            expert_idx,
+            device=x.device,
+            dtype=torch.long,
+        )
+        local_w = torch.ones(
+            (x.shape[0], 1),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        return module.experts(x, local_idx, local_w)
+    except Exception:
+        pass
+
+    # Fallback: native packed HF GLM-5 layout.
+    if hasattr(module.experts, "gate_up_proj") and hasattr(module.experts, "down_proj"):
+        gate_up = module.experts.gate_up_proj[expert_idx].to(dtype=x.dtype)
+        down = module.experts.down_proj[expert_idx].to(dtype=x.dtype)
+        gate, up = F.linear(x, gate_up).chunk(2, dim=-1)
+        expert_hidden = module.experts.act_fn(gate) * up
+        return F.linear(expert_hidden, down)
+
+    raise AttributeError(
+        "Unsupported GLM-5 expert layout for observer hook. "
+        f"experts_cls={module.experts.__class__.__name__}, "
+        f"children={list(dict(module.experts.named_children()).keys())}, "
+        f"params={[name for name, _ in module.experts.named_parameters(recurse=False)]}"
+    )
+
+
 class BaseTransformerObserver(ABC):
     def __init__(
         self,
@@ -400,15 +445,13 @@ class MoETransformerObserver(BaseTransformerObserver):
 
                     expert_input = flat_input[row_idx]  # (n_active, hidden)
 
-                    compute_dtype = expert_input.dtype  # usually torch.bfloat16 for GLM-5 FP8
-
-                    gate_up = module.experts.gate_up_proj[exp_idx].to(dtype=compute_dtype)
-                    down = module.experts.down_proj[exp_idx].to(dtype=compute_dtype)
-                    expert_input = expert_input.to(dtype=compute_dtype)
-
-                    gate, up = F.linear(expert_input, gate_up).chunk(2, dim=-1)
-                    expert_hidden = module.experts.act_fn(gate) * up
-                    expert_out = F.linear(expert_hidden, down)
+                    compute_dtype = expert_input.dtype
+                    expert_out = _glm5_single_expert_forward(
+                        module=module,
+                        expert_input=expert_input,
+                        expert_idx=exp_idx,
+                        compute_dtype=compute_dtype,
+                    )
 
                     weights = topk_weights[row_idx, topk_pos].to(torch.float32)
                     ean_norm = torch.linalg.norm(expert_out, dim=-1).to(torch.float32)
