@@ -33,36 +33,13 @@ class BaseTransformerObserverHookConfig:
     module_class_name_to_hook_regex: Optional[nn.Module] = None
 
 
-def _glm5_single_expert_forward(module, expert_input, expert_idx, compute_dtype):
+def _glm5_single_expert_forward_fallback(module, expert_input, expert_idx, compute_dtype):
     """
-    Compute the unweighted output of a single GLM-5 expert.
-
-    Works for:
-    - native / FP8 packed GlmMoeDsaNaiveMoe
-    - GPTQModel/AWQ replacements that still preserve the experts(...) call interface
+    Slow fallback for native packed GLM-5 layout.
+    Used only if the batched experts(...) path is unavailable.
     """
     x = expert_input.to(compute_dtype)
 
-    # Preferred path: use the experts module's public forward API.
-    # We pass a single routed expert and unit weights so the returned output
-    # is unweighted and matches the semantics of the original REAP math.
-    try:
-        local_idx = torch.full(
-            (x.shape[0], 1),
-            expert_idx,
-            device=x.device,
-            dtype=torch.long,
-        )
-        local_w = torch.ones(
-            (x.shape[0], 1),
-            device=x.device,
-            dtype=x.dtype,
-        )
-        return module.experts(x, local_idx, local_w)
-    except Exception:
-        pass
-
-    # Fallback: native packed HF GLM-5 layout.
     if hasattr(module.experts, "gate_up_proj") and hasattr(module.experts, "down_proj"):
         gate_up = module.experts.gate_up_proj[expert_idx].to(dtype=x.dtype)
         down = module.experts.down_proj[expert_idx].to(dtype=x.dtype)
@@ -71,11 +48,55 @@ def _glm5_single_expert_forward(module, expert_input, expert_idx, compute_dtype)
         return F.linear(expert_hidden, down)
 
     raise AttributeError(
-        "Unsupported GLM-5 expert layout for observer hook. "
+        "Unsupported GLM-5 expert layout for observer fallback. "
         f"experts_cls={module.experts.__class__.__name__}, "
         f"children={list(dict(module.experts.named_children()).keys())}, "
         f"params={[name for name, _ in module.experts.named_parameters(recurse=False)]}"
     )
+
+
+def _glm5_expert_forward_rows(
+    module,
+    pair_inputs,
+    pair_expert_ids,
+    compute_dtype,
+    chunk_size: int = 4096,
+):
+    """
+    Fast path for native GLM-5 and AWQ/GPTQModel wrappers.
+
+    Runs all routed token-expert pairs through module.experts(...) in large chunks
+    instead of expert-by-expert, which is far faster for AWQ GEMM kernels.
+    """
+    x = pair_inputs.to(compute_dtype)
+    local_idx = pair_expert_ids[:, None].to(torch.long)
+    local_w = torch.ones(
+        (pair_expert_ids.shape[0], 1),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    # Preferred path: batched call through the expert module's public forward API.
+    try:
+        outs = []
+        for start in range(0, x.shape[0], chunk_size):
+            end = start + chunk_size
+            outs.append(module.experts(x[start:end], local_idx[start:end], local_w[start:end]))
+        return torch.cat(outs, dim=0)
+    except Exception:
+        pass
+
+    # Fallback: do the same work grouped by expert through the native packed path.
+    out = torch.empty_like(x)
+    for exp_idx in pair_expert_ids.unique().tolist():
+        rows = (pair_expert_ids == exp_idx).nonzero(as_tuple=True)[0]
+        out[rows] = _glm5_single_expert_forward_fallback(
+            module=module,
+            expert_input=x[rows],
+            expert_idx=int(exp_idx),
+            compute_dtype=x.dtype,
+        )
+    return out
 
 
 class BaseTransformerObserver(ABC):
@@ -423,61 +444,140 @@ class MoETransformerObserver(BaseTransformerObserver):
             if module.__class__.__name__ == "GlmMoeDsaMoE":
                 state = self.state[layer_number]
 
+                attention_mask = self._current_attention_mask
+                if attention_mask is not None:
+                    flat_mask = attention_mask.view(-1).bool().to(device)
+                    flat_input = flat_input[flat_mask]
+                else:
+                    flat_mask = None
+
+                if flat_input.shape[0] == 0:
+                    return
+
                 # Router path used by GLM-5
                 router_logits = module.gate(flat_input)  # (tokens, num_experts)
                 topk_indices, topk_weights = module.route_tokens_to_experts(router_logits)
 
-                # Unweighted token frequency
-                expert_frequency = torch.bincount(
-                    topk_indices.reshape(-1), minlength=num_experts
-                ).to(device)
+                if self.hook_config.renormalize_router_weights:
+                    denom = topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+                        torch.finfo(topk_weights.dtype).eps
+                    )
+                    topk_weights = topk_weights / denom
 
+                num_valid_tokens = flat_input.shape[0]
                 state["total_tokens"] += torch.tensor(
-                    flat_input.shape[0], device="cpu", dtype=torch.long
+                    num_valid_tokens, device="cpu", dtype=torch.long
                 )
+
+                # Flatten token-expert assignments.
+                pair_expert_ids = topk_indices.reshape(-1).to(torch.long)  # [tokens * top_k]
+                pair_weights = topk_weights.reshape(-1).to(torch.float32)  # [tokens * top_k]
+                pair_inputs = flat_input.repeat_interleave(topk_indices.shape[1], dim=0)
+
+                valid = pair_expert_ids >= 0
+                pair_expert_ids = pair_expert_ids[valid]
+                pair_weights = pair_weights[valid]
+                pair_inputs = pair_inputs[valid]
+
+                expert_frequency = torch.bincount(
+                    pair_expert_ids, minlength=num_experts
+                )
+                pairwise_expert_frequency = (
+                        expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)
+                )
+
                 state["expert_frequency"] += expert_frequency.to("cpu", torch.long)
+                state["pairwise_expert_frequency"] += pairwise_expert_frequency.to(
+                    "cpu", torch.long
+                )
 
-                # Compute pruning metrics expert-by-expert from packed weights
-                for exp_idx in range(num_experts):
-                    row_idx, topk_pos = (topk_indices == exp_idx).nonzero(as_tuple=True)
-                    if row_idx.numel() == 0:
-                        continue
+                compute_dtype = pair_inputs.dtype
+                expert_out = _glm5_expert_forward_rows(
+                    module=module,
+                    pair_inputs=pair_inputs,
+                    pair_expert_ids=pair_expert_ids,
+                    compute_dtype=compute_dtype,
+                    chunk_size=4096,
+                )
 
-                    expert_input = flat_input[row_idx]  # (n_active, hidden)
+                row_norms = torch.linalg.norm(expert_out, dim=-1).to(torch.float32)
+                row_maxabs = expert_out.abs().amax(dim=-1).to(torch.float32)
 
-                    compute_dtype = expert_input.dtype
-                    expert_out = _glm5_single_expert_forward(
-                        module=module,
-                        expert_input=expert_input,
-                        expert_idx=exp_idx,
-                        compute_dtype=compute_dtype,
-                    )
+                ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+                weighted_ean_sum = torch.zeros(
+                    num_experts, device=device, dtype=torch.float64
+                )
+                weighted_expert_frequency_sum = torch.zeros(
+                    num_experts, device=device, dtype=torch.float64
+                )
 
-                    weights = topk_weights[row_idx, topk_pos].to(torch.float32)
-                    ean_norm = torch.linalg.norm(expert_out, dim=-1).to(torch.float32)
+                ean_sum.scatter_add_(0, pair_expert_ids, row_norms.to(torch.float64))
+                weighted_ean_sum.scatter_add_(
+                    0,
+                    pair_expert_ids,
+                    (row_norms * pair_weights).to(torch.float64),
+                )
+                weighted_expert_frequency_sum.scatter_add_(
+                    0,
+                    pair_expert_ids,
+                    pair_weights.to(torch.float64),
+                )
 
-                    state["ean_sum"][exp_idx] += ean_norm.sum().to(torch.float64).cpu()
-                    state["weighted_ean_sum"][exp_idx] += (
-                            ean_norm * weights
-                    ).sum().to(torch.float64).cpu()
-                    state["weighted_expert_frequency_sum"][exp_idx] += (
-                        weights.sum().to(torch.float64).cpu()
-                    )
+                safe_counts = expert_frequency.clamp_min(1).to(torch.float64)
+                ean_mean = (ean_sum / safe_counts).to(torch.float32)
+                reap_vals = (weighted_ean_sum / safe_counts).to(torch.float32)
 
-                    state["ean_mean"].update(
-                        ean_norm.mean().view(1).cpu(),
-                        torch.tensor([row_idx.numel()], dtype=torch.long),
-                    )
-                    state["reap"].update(
-                        (ean_norm * weights).mean().view(1).cpu(),
-                        torch.tensor([row_idx.numel()], dtype=torch.long),
-                    )
+                inactive = expert_frequency == 0
+                ean_mean[inactive] = 0
+                reap_vals[inactive] = 0
 
-                    current_max = expert_out.abs().max().to(torch.float32).cpu()
-                    state["max_activations"][exp_idx] = torch.maximum(
-                        state["max_activations"][exp_idx], current_max
-                    )
+                per_expert_max = torch.full(
+                    (num_experts,),
+                    float("-inf"),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                per_expert_max.scatter_reduce_(
+                    0,
+                    pair_expert_ids,
+                    row_maxabs,
+                    reduce="amax",
+                    include_self=True,
+                )
+                per_expert_max[torch.isinf(per_expert_max)] = 0
 
+                state["ean_sum"] += ean_sum.to("cpu")
+                state["weighted_ean_sum"] += weighted_ean_sum.to("cpu")
+                state["weighted_expert_frequency_sum"] += (
+                    weighted_expert_frequency_sum.to("cpu")
+                )
+                state["ean_mean"].update(ean_mean.cpu(), expert_frequency.cpu())
+                state["reap"].update(reap_vals.cpu(), expert_frequency.cpu())
+                state["max_activations"] = torch.maximum(
+                    state["max_activations"],
+                    per_expert_max.cpu(),
+                )
+
+                del (
+                    router_logits,
+                    topk_indices,
+                    topk_weights,
+                    pair_inputs,
+                    pair_expert_ids,
+                    pair_weights,
+                    expert_out,
+                    row_norms,
+                    row_maxabs,
+                    expert_frequency,
+                    pairwise_expert_frequency,
+                    ean_sum,
+                    weighted_ean_sum,
+                    weighted_expert_frequency_sum,
+                    ean_mean,
+                    reap_vals,
+                    per_expert_max,
+                )
+                gc.collect()
                 return
 
             if not len(output) >= 2:

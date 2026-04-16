@@ -141,9 +141,46 @@ MODEL_ATTRS = {
 }
 
 
+def get_transformer_layers_root(model):
+    """
+    Return the module that owns `.layers` for both native HF models and wrappers
+    such as GPTQModel QModel.
+
+    Examples:
+    - native GLM-5: model.model.layers
+    - GPTQModel AWQ wrapper: model.model.model.layers
+    """
+    cur = model
+    seen = set()
+
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+
+        if hasattr(cur, "layers"):
+            return cur
+
+        if hasattr(cur, "model"):
+            cur = cur.model
+            continue
+
+        break
+
+    raise AttributeError(
+        f"Could not find transformer layers root for {model.__class__.__name__}"
+    )
+
+
 def get_moe(model, layer):
-    moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    if model_attrs is None:
+        raise KeyError(
+            f"MODEL_ATTRS does not contain {model.__class__.__name__}. "
+            f"Known: {list(MODEL_ATTRS.keys())}"
+        )
+
+    moe_attr_name = model_attrs["moe_block"]
+    layers_root = get_transformer_layers_root(model)
+    return getattr(layers_root.layers[layer], moe_attr_name)
 
 
 def _set_tensor_by_name(module: nn.Module, name: str, tensor: torch.Tensor, is_buffer: bool):
@@ -159,30 +196,56 @@ def _set_tensor_by_name(module: nn.Module, name: str, tensor: torch.Tensor, is_b
 
 
 def prune_glm5_moe_inplace(moe, retained_expert_indices):
+    """
+    In-place pruning for native/FP8 GLM-5 packed-expert layout.
+
+    This works for layouts where expert-packed params/buffers live under
+    `moe.experts` with expert axis on dim 0.
+
+    Note:
+    - This is good for native/FP8 GLM-5.
+    - AWQ/GPTQModel may still need a separate pruning path depending on how
+      experts are wrapped/replaced internally.
+    """
+    keep_list = [int(i) for i in retained_expert_indices]
     keep = torch.as_tensor(
-        retained_expert_indices,
+        keep_list,
         dtype=torch.long,
         device=moe.gate.weight.device,
     )
 
     old_num_experts = int(moe.n_routed_experts)
     new_num_experts = int(keep.numel())
+    found_any_expert_axis = False
 
-    # Prune every expert-packed parameter whose first dimension is num_experts
-    for name, param in list(moe.experts.named_parameters(recurse=True)):
-        if param is None:
-            continue
-        if param.ndim > 0 and param.shape[0] == old_num_experts:
-            new_param = param.index_select(0, keep).contiguous()
-            _set_tensor_by_name(moe.experts, name, new_param, is_buffer=False)
+    if isinstance(getattr(moe, "experts", None), nn.ModuleList):
+        moe.experts = nn.ModuleList([moe.experts[i] for i in keep_list])
+        found_any_expert_axis = True
+    else:
+        for name, param in list(moe.experts.named_parameters(recurse=True)):
+            if param is None:
+                continue
+            if param.ndim > 0 and param.shape[0] == old_num_experts:
+                new_param = param.index_select(0, keep).contiguous()
+                _set_tensor_by_name(moe.experts, name, new_param, is_buffer=False)
+                found_any_expert_axis = True
 
-    # Prune every expert-packed buffer too (this is the important FP8 part)
-    for name, buf in list(moe.experts.named_buffers(recurse=True)):
-        if buf is None:
-            continue
-        if buf.ndim > 0 and buf.shape[0] == old_num_experts:
-            new_buf = buf.index_select(0, keep).contiguous()
-            _set_tensor_by_name(moe.experts, name, new_buf, is_buffer=True)
+        # Prune every expert-packed buffer too (this is the important FP8 part)
+        for name, buf in list(moe.experts.named_buffers(recurse=True)):
+            if buf is None:
+                continue
+            if buf.ndim > 0 and buf.shape[0] == old_num_experts:
+                new_buf = buf.index_select(0, keep).contiguous()
+                _set_tensor_by_name(moe.experts, name, new_buf, is_buffer=True)
+                found_any_expert_axis = True
+
+    if not found_any_expert_axis:
+        raise RuntimeError(
+            "prune_glm5_moe_inplace could not find any expert-axis tensors under "
+            f"{moe.experts.__class__.__name__}. This likely means the model is using "
+            "a different runtime layout (for example AWQ/GPTQModel) and needs a "
+            "separate pruning adapter."
+        )
 
     # Router
     moe.gate.weight = nn.Parameter(
