@@ -374,9 +374,8 @@ class MoETransformerObserver(BaseTransformerObserver):
             if layer_number not in self.state:
                 self.state[layer_number] = self._initialize_state(output, num_experts)
 
-            # GLM-style MoE blocks that return only hidden states and expose routing via
-            # gate + route_tokens_to_experts.
-            if module.__class__.__name__ in {"GlmMoeDsaMoE", "Glm4MoeLiteMoE"}:
+            # GLM-5 / GlmMoeDsaMoE special case
+            if module.__class__.__name__ == "GlmMoeDsaMoE":
                 state = self.state[layer_number]
 
                 # Router path used by GLM-5
@@ -739,7 +738,7 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 
 @dataclass
 class Glm44LiteQMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Glm4MoeLiteMoE"
+    module_name_to_hook_regex: Optional[str] = r"layers\.\d+\.mlp$"
     num_experts_attr_name: str = "config.n_routed_experts"
     top_k_attr_name: str = "config.num_experts_per_tok"
     fused_experts: bool = False
