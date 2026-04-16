@@ -56,55 +56,10 @@ def _set_tensor_by_name(module: nn.Module, name: str, tensor: torch.Tensor, is_b
         parent._parameters[leaf] = nn.Parameter(tensor, requires_grad=False)
 
 
-def _prune_modulelists_recursively(module: nn.Module, keep_list: list[int], old_num_experts: int) -> bool:
-    changed = False
-
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.ModuleList) and len(child) == old_num_experts:
-            setattr(module, name, nn.ModuleList([child[i] for i in keep_list]))
-            changed = True
-        else:
-            changed = _prune_modulelists_recursively(child, keep_list, old_num_experts) or changed
-
-    return changed
-
-
-def _prune_numeric_children_container(module: nn.Module, keep_list: list[int], old_num_experts: int) -> bool:
-    """
-    Handle containers that store experts as numeric child names:
-      module._modules = {'0': expert0, '1': expert1, ..., '255': expert255, 'act_fn': ...}
-
-    This is the layout you hit with AWQ/GPTQModel.
-    """
-    changed = False
-
-    child_names = list(module._modules.keys())
-    numeric_names = [name for name in child_names if name.isdigit()]
-
-    # Direct expert container case.
-    if len(numeric_names) == old_num_experts:
-        new_modules = OrderedDict()
-
-        # preserve all non-expert children first (e.g. act_fn)
-        for name, child in module._modules.items():
-            if not name.isdigit():
-                new_modules[name] = child
-
-        # reindex retained experts contiguously: 0..new_num_experts-1
-        for new_idx, old_idx in enumerate(keep_list):
-            new_modules[str(new_idx)] = module._modules[str(old_idx)]
-
-        module._modules = new_modules
-        changed = True
-
-    # Recurse into children too.
-    for _, child in list(module.named_children()):
-        changed = _prune_numeric_children_container(child, keep_list, old_num_experts) or changed
-
-    return changed
-
-
 def _prune_packed_expert_tensors(module: nn.Module, keep: torch.Tensor, old_num_experts: int) -> bool:
+    """
+    Native / FP8 packed layout: expert axis lives on dim 0 of params/buffers.
+    """
     changed = False
 
     for name, param in list(module.named_parameters(recurse=True)):
@@ -126,12 +81,58 @@ def _prune_packed_expert_tensors(module: nn.Module, keep: torch.Tensor, old_num_
     return changed
 
 
+def _prune_modulelists_recursively(module: nn.Module, keep_list: list[int], old_num_experts: int) -> bool:
+    """
+    Handles layouts where experts are stored inside ModuleLists.
+    """
+    changed = False
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.ModuleList) and len(child) == old_num_experts:
+            setattr(module, name, nn.ModuleList([child[i] for i in keep_list]))
+            changed = True
+        else:
+            changed = _prune_modulelists_recursively(child, keep_list, old_num_experts) or changed
+
+    return changed
+
+
+def _prune_numbered_expert_children(module: nn.Module, keep_list: list[int], old_num_experts: int) -> bool:
+    """
+    Handles AWQ/GPTQModel layout where experts live as numbered children
+    directly under `moe.experts`, e.g.:
+      experts._modules = {'act_fn': ..., '0': expert0, '1': expert1, ...}
+    """
+    modules_dict = module._modules
+    numeric_names = sorted([name for name in modules_dict.keys() if name.isdigit()], key=int)
+
+    if len(numeric_names) != old_num_experts:
+        return False
+
+    # Require a dense 0..old_num_experts-1 mapping to be safe.
+    expected = [str(i) for i in range(old_num_experts)]
+    if numeric_names != expected:
+        return False
+
+    kept_children = [modules_dict[str(i)] for i in keep_list]
+
+    # Remove old expert entries, keep non-expert children like act_fn.
+    for name in expected:
+        del modules_dict[name]
+
+    # Reinsert renumbered experts as 0..new_num_experts-1
+    for new_idx, child in enumerate(kept_children):
+        modules_dict[str(new_idx)] = child
+
+    return True
+
+
 def prune_glm5_moe_inplace(moe, retained_expert_indices):
     """
     In-place pruning for GLM-5 across:
     - native / FP8 packed expert tensors
-    - exploded nn.ModuleList expert layouts
-    - exploded numeric-child expert layouts used by AWQ/GPTQModel
+    - ModuleList-based layouts
+    - AWQ/GPTQModel numbered-child layouts
     """
     keep_list = [int(i) for i in retained_expert_indices]
     keep = torch.as_tensor(
@@ -145,14 +146,14 @@ def prune_glm5_moe_inplace(moe, retained_expert_indices):
 
     changed = False
 
-    # 1) native packed layout
+    # 1) Native/FP8 packed layout
     changed = _prune_packed_expert_tensors(moe.experts, keep, old_num_experts) or changed
 
     # 2) ModuleList layout
     changed = _prune_modulelists_recursively(moe.experts, keep_list, old_num_experts) or changed
 
-    # 3) numeric-child layout (AWQ/GPTQModel)
-    changed = _prune_numeric_children_container(moe.experts, keep_list, old_num_experts) or changed
+    # 3) Numbered-child AWQ layout
+    changed = _prune_numbered_expert_children(moe.experts, keep_list, old_num_experts) or changed
 
     if not changed:
         child_names = [name for name, _ in moe.experts.named_children()]
@@ -160,11 +161,11 @@ def prune_glm5_moe_inplace(moe, retained_expert_indices):
         raise RuntimeError(
             "Could not find a recognized expert layout. "
             f"experts_cls={moe.experts.__class__.__name__}, "
-            f"child_names={child_names[:50]}, "
-            f"sample_params={param_names[:50]}"
+            f"child_names={child_names[:30]}, "
+            f"sample_params={param_names[:30]}"
         )
 
-    # Router is still expert-axis.
+    # Router pruning still applies in all layouts.
     moe.gate.weight = nn.Parameter(
         moe.gate.weight.index_select(0, keep).contiguous(),
         requires_grad=False,
