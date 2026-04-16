@@ -404,13 +404,8 @@ class MoETransformerObserver(BaseTransformerObserver):
                 self.state[layer_number] = self._initialize_state(output, num_experts)
 
             # GLM-style MoE blocks that return only hidden states and expose routing via
-            # gate + route_tokens_to_experts. Some quantized wrappers rename the class
-            # (for example, LinearGlm4MoeLiteMoE), so detect them by capability rather
-            # than exact class name.
-            is_glm_tensor_output_moe = hasattr(module, "gate") and hasattr(
-                module, "route_tokens_to_experts"
-            )
-            if is_glm_tensor_output_moe:
+            # gate + route_tokens_to_experts.
+            if module.__class__.__name__ in {"GlmMoeDsaMoE", "Glm4MoeLiteMoE"}:
                 state = self.state[layer_number]
 
                 # Router path used by GLM-5
