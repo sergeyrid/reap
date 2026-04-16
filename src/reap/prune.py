@@ -322,7 +322,7 @@ def prune(
         retained_by_layer[layer] = [int(x) for x in retained_expert_indicies]
         # prune experts
         moe = get_moe(model, layer)
-        if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+        if model.__class__.__name__ in ["GlmMoeDsaForCausalLM", "GlmMoeDsaQModel"]:
             prune_glm5_moe_inplace(moe, retained_expert_indicies)
         elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
@@ -366,7 +366,7 @@ def prune(
     retained_experts = len(retained_expert_indicies)
     setattr(model.config, model_attrs["num_experts"], retained_experts)
 
-    if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+    if model.__class__.__name__ in ["GlmMoeDsaForCausalLM", "GlmMoeDsaQModel"]:
         model.config.num_experts_per_tok = min(
             int(model.config.num_experts_per_tok),
             retained_experts,
@@ -389,7 +389,7 @@ def prune(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
     )
 
-    if model.__class__.__name__ == "GlmMoeDsaForCausalLM":
+    if model.__class__.__name__ in ["GlmMoeDsaForCausalLM", "GlmMoeDsaQModel"]:
         repair_glm5_mtp_checkpoint(
             source_model_dir=source_model_dir,
             pruned_model_dir=pruned_model_dir,

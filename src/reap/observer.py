@@ -798,6 +798,7 @@ class Glm44LiteQMoEObserverHookConfig(MoETransformerObserverConfig):
 
 
 OBSERVER_CONFIG_REGISTRY = {
+    "GlmMoeDsaQModel": Glm5MoEObserverHookConfig,
     "GlmMoeDsaForCausalLM": Glm5MoEObserverHookConfig,
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
