@@ -427,41 +427,23 @@ class MoETransformerObserver(BaseTransformerObserver):
                 )
                 state["expert_frequency"] += expert_frequency.to("cpu", torch.long)
 
-                # Compute pruning metrics expert-by-expert from either packed expert
-                # weights or ModuleList-based experts used by some quantized wrappers.
-                experts_module = module.experts
-                experts_are_module_list = isinstance(experts_module, nn.ModuleList)
-                experts_are_packed = (
-                    not experts_are_module_list
-                    and hasattr(experts_module, "gate_up_proj")
-                    and hasattr(experts_module, "down_proj")
-                )
+                # Compute pruning metrics expert-by-expert from packed weights
                 for exp_idx in range(num_experts):
                     row_idx, topk_pos = (topk_indices == exp_idx).nonzero(as_tuple=True)
                     if row_idx.numel() == 0:
                         continue
 
                     expert_input = flat_input[row_idx]  # (n_active, hidden)
-                    compute_dtype = expert_input.dtype
 
-                    if experts_are_module_list:
-                        expert_module = experts_module[exp_idx]
-                        expert_out = expert_module(expert_input).to(device)
-                    elif experts_are_packed:
-                        gate_up = experts_module.gate_up_proj[exp_idx].to(
-                            dtype=compute_dtype
-                        )
-                        down = experts_module.down_proj[exp_idx].to(dtype=compute_dtype)
-                        expert_input = expert_input.to(dtype=compute_dtype)
+                    compute_dtype = expert_input.dtype  # usually torch.bfloat16 for GLM-5 FP8
 
-                        gate, up = F.linear(expert_input, gate_up).chunk(2, dim=-1)
-                        expert_hidden = experts_module.act_fn(gate) * up
-                        expert_out = F.linear(expert_hidden, down)
-                    else:
-                        raise ValueError(
-                            f"Unsupported expert container {experts_module.__class__.__name__} "
-                            f"for module {module.__class__.__name__} at layer {layer_number}."
-                        )
+                    gate_up = module.experts.gate_up_proj[exp_idx].to(dtype=compute_dtype)
+                    down = module.experts.down_proj[exp_idx].to(dtype=compute_dtype)
+                    expert_input = expert_input.to(dtype=compute_dtype)
+
+                    gate, up = F.linear(expert_input, gate_up).chunk(2, dim=-1)
+                    expert_hidden = module.experts.act_fn(gate) * up
+                    expert_out = F.linear(expert_hidden, down)
 
                     weights = topk_weights[row_idx, topk_pos].to(torch.float32)
                     ean_norm = torch.linalg.norm(expert_out, dim=-1).to(torch.float32)
