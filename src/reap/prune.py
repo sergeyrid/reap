@@ -449,7 +449,7 @@ def main():
     # load model
     model = GPTQModel.load(
         model_name,
-        device_map="auto",
+        device="auto",
         backend=BACKEND.AWQ_GEMM_TRITON,
     )
     # record activations or load previously recorded activations
