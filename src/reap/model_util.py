@@ -170,6 +170,35 @@ def get_transformer_layers_root(model):
     )
 
 
+def get_transformer_layers_root(model):
+    """
+    Find the module that owns `.layers` for both native HF models and wrappers
+    such as GPTQModel QModel.
+
+    Examples:
+    - native GLM-5: model.model.layers
+    - GPTQModel AWQ wrapper: model.model.model.layers
+    """
+    cur = model
+    seen = set()
+
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+
+        if hasattr(cur, "layers"):
+            return cur
+
+        if hasattr(cur, "model"):
+            cur = cur.model
+            continue
+
+        break
+
+    raise AttributeError(
+        f"Could not find transformer layers root for {model.__class__.__name__}"
+    )
+
+
 def get_moe(model, layer):
     model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
     if model_attrs is None:
@@ -195,17 +224,56 @@ def _set_tensor_by_name(module: nn.Module, name: str, tensor: torch.Tensor, is_b
         parent._parameters[leaf] = nn.Parameter(tensor, requires_grad=False)
 
 
+def _prune_modulelists_recursively(module: nn.Module, keep_list: list[int], old_num_experts: int) -> bool:
+    """
+    Recursively prune any ModuleList whose length equals the expert count.
+    This is the key path for AWQ/GPTQModel layouts where experts are exploded
+    into per-expert modules instead of packed tensors.
+    """
+    changed = False
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.ModuleList) and len(child) == old_num_experts:
+            new_child = nn.ModuleList([child[i] for i in keep_list])
+            setattr(module, name, new_child)
+            changed = True
+        else:
+            changed = _prune_modulelists_recursively(child, keep_list, old_num_experts) or changed
+
+    return changed
+
+
+def _prune_packed_expert_tensors(module: nn.Module, keep: torch.Tensor, old_num_experts: int) -> bool:
+    """
+    Prune packed expert params/buffers whose first dimension is expert index.
+    This is the native/FP8 path.
+    """
+    changed = False
+
+    for name, param in list(module.named_parameters(recurse=True)):
+        if param is None:
+            continue
+        if param.ndim > 0 and param.shape[0] == old_num_experts:
+            new_param = param.index_select(0, keep).contiguous()
+            _set_tensor_by_name(module, name, new_param, is_buffer=False)
+            changed = True
+
+    for name, buf in list(module.named_buffers(recurse=True)):
+        if buf is None:
+            continue
+        if buf.ndim > 0 and buf.shape[0] == old_num_experts:
+            new_buf = buf.index_select(0, keep).contiguous()
+            _set_tensor_by_name(module, name, new_buf, is_buffer=True)
+            changed = True
+
+    return changed
+
+
 def prune_glm5_moe_inplace(moe, retained_expert_indices):
     """
-    In-place pruning for native/FP8 GLM-5 packed-expert layout.
-
-    This works for layouts where expert-packed params/buffers live under
-    `moe.experts` with expert axis on dim 0.
-
-    Note:
-    - This is good for native/FP8 GLM-5.
-    - AWQ/GPTQModel may still need a separate pruning path depending on how
-      experts are wrapped/replaced internally.
+    In-place pruning for GLM-5 across both:
+    - native / FP8 packed expert tensors
+    - AWQ/GPTQModel exploded per-expert ModuleList layouts
     """
     keep_list = [int(i) for i in retained_expert_indices]
     keep = torch.as_tensor(
@@ -216,44 +284,34 @@ def prune_glm5_moe_inplace(moe, retained_expert_indices):
 
     old_num_experts = int(moe.n_routed_experts)
     new_num_experts = int(keep.numel())
-    found_any_expert_axis = False
 
-    if isinstance(getattr(moe, "experts", None), nn.ModuleList):
-        moe.experts = nn.ModuleList([moe.experts[i] for i in keep_list])
-        found_any_expert_axis = True
-    else:
-        for name, param in list(moe.experts.named_parameters(recurse=True)):
-            if param is None:
-                continue
-            if param.ndim > 0 and param.shape[0] == old_num_experts:
-                new_param = param.index_select(0, keep).contiguous()
-                _set_tensor_by_name(moe.experts, name, new_param, is_buffer=False)
-                found_any_expert_axis = True
+    changed = False
 
-        # Prune every expert-packed buffer too (this is the important FP8 part)
-        for name, buf in list(moe.experts.named_buffers(recurse=True)):
-            if buf is None:
-                continue
-            if buf.ndim > 0 and buf.shape[0] == old_num_experts:
-                new_buf = buf.index_select(0, keep).contiguous()
-                _set_tensor_by_name(moe.experts, name, new_buf, is_buffer=True)
-                found_any_expert_axis = True
+    # 1) Native / FP8 packed tensors under moe.experts
+    changed = _prune_packed_expert_tensors(moe.experts, keep, old_num_experts) or changed
 
-    if not found_any_expert_axis:
+    # 2) AWQ / GPTQModel exploded expert modules under moe.experts
+    changed = _prune_modulelists_recursively(moe.experts, keep_list, old_num_experts) or changed
+
+    if not changed:
+        child_names = [name for name, _ in moe.experts.named_children()]
+        param_names = [name for name, _ in moe.experts.named_parameters(recurse=True)]
         raise RuntimeError(
-            "prune_glm5_moe_inplace could not find any expert-axis tensors under "
-            f"{moe.experts.__class__.__name__}. This likely means the model is using "
-            "a different runtime layout (for example AWQ/GPTQModel) and needs a "
-            "separate pruning adapter."
+            "prune_glm5_moe_inplace could not find a recognized GLM-5 expert layout. "
+            f"experts_cls={moe.experts.__class__.__name__}, "
+            f"child_names={child_names[:30]}, "
+            f"sample_params={param_names[:30]}"
         )
 
-    # Router
+    # Router is still expert-axis even under AWQ.
     moe.gate.weight = nn.Parameter(
         moe.gate.weight.index_select(0, keep).contiguous(),
         requires_grad=False,
     )
     if hasattr(moe.gate, "e_score_correction_bias") and moe.gate.e_score_correction_bias is not None:
-        moe.gate.e_score_correction_bias = moe.gate.e_score_correction_bias.index_select(0, keep).contiguous()
+        moe.gate.e_score_correction_bias = (
+            moe.gate.e_score_correction_bias.index_select(0, keep).contiguous()
+        )
 
     # Metadata
     moe.n_routed_experts = new_num_experts
